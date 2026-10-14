@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  TDeez AI backend (outline). API Gateway HTTP API + Lambda, DynamoDB, private S3, OpenSearch
+  Serverless (vector), SES identity, least-privilege IAM. Review before deploying: this is an
+  outline that has not been deployed from this repo.
+
+Parameters:
+  CognitoUserPoolId: { Type: String }
+  CognitoAppClientId: { Type: String }
+  SesSenderEmail: { Type: String, Description: Verified sender (SES email identity) }
+  QuoteInboxEmail: { Type: String, Description: TDeez inbox that receives quote requests }
+  FrontendOrigin: { Type: String, Default: "http://localhost:5173" }
+  CanvasModelId: { Type: String, Default: "amazon.nova-canvas-v1:0" }
+  VisionModelId: { Type: String, Default: "amazon.nova-pro-v1:0" }
+  EmbeddingModelId: { Type: String, Default: "amazon.titan-embed-image-v1" }
+  CollectionName: { Type: String, Default: "tdeez-slabs", AllowedPattern: "[a-z][a-z0-9-]{2,31}" }
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120 # Canvas generation is slow. NOTE: API Gateway HTTP APIs cut off at 30 s, see README.
+    MemorySize: 1024
+    Architectures: [x86_64]
+
+Resources:
+  # ---------------------------------------------------------------- API + Lambda
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref FrontendOrigin]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+      Auth:
+        # Defence in depth: the app verifies the JWT itself as well. /share/{token} and /health stay public.
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}"
+              audience: [!Ref CognitoAppClientId]
+            IdentitySource: "$request.header.Authorization"
+
+  Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: tdeez_ai.handler.handler
+      Environment:
+        Variables:
+          USE_MOCK: "false"
+          APP_ENV: prod
+          CORS_ALLOW_ORIGINS: !Sub '["${FrontendOrigin}"]'
+          CANVAS_MODEL_ID: !Ref CanvasModelId
+          VISION_MODEL_ID: !Ref VisionModelId
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+          S3_BUCKET: !Ref ImageBucket
+          CREATIONS_TABLE: !Ref CreationsTable
+          SLABS_TABLE: !Ref SlabsTable
+          PROFILES_TABLE: !Ref ProfilesTable
+          QUOTES_TABLE: !Ref QuotesTable
+          OPENSEARCH_ENDPOINT: !GetAtt Collection.CollectionEndpoint
+          SES_SENDER: !Ref SesSenderEmail
+          QUOTE_INBOX: !Ref QuoteInboxEmail
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_APP_CLIENT_ID: !Ref CognitoAppClientId
+      Events:
+        Public:
+          Type: HttpApi
+          Properties: { ApiId: !Ref Api, Path: "/share/{token}", Method: GET, Auth: { Authorizer: NONE } }
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref Api, Path: /health, Method: GET, Auth: { Authorizer: NONE } }
+        Everything:
+          Type: HttpApi
+          Properties: { ApiId: !Ref Api, Path: "/{proxy+}", Method: ANY }
+      Policies:
+        - Statement:
+            - Sid: InvokeSpecificBedrockModelsOnly
+              Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource:
+                # Converse uses the bedrock:InvokeModel permission. If you switch to a cross-region
+                # inference profile (e.g. us.amazon.nova-pro-v1:0), also allow that profile ARN and
+                # the underlying foundation-model ARNs in each region it routes to.
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${CanvasModelId}"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${VisionModelId}"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+            - Sid: Images
+              Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+              Resource: !Sub "${ImageBucket.Arn}/*"
+            - Sid: Tables
+              Effect: Allow
+              Action:
+                [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+              Resource:
+                - !GetAtt CreationsTable.Arn
+                - !Sub "${CreationsTable.Arn}/index/*"
+                - !GetAtt SlabsTable.Arn
+                - !Sub "${SlabsTable.Arn}/index/*"
+                - !GetAtt ProfilesTable.Arn
+                - !GetAtt QuotesTable.Arn
+            - Sid: VectorSearch
+              Effect: Allow
+              Action: [aoss:APIAccessAll]
+              Resource: !GetAtt Collection.Arn
+            - Sid: SendQuoteMail
+              Effect: Allow
+              Action: [ses:SendEmail]
+              Resource: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${SesSenderEmail}"
+
+  # ---------------------------------------------------------------- Storage
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref FrontendOrigin]
+            AllowedMethods: [PUT, GET]
+            AllowedHeaders: ["*"]
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDerivedImages
+            Status: Enabled
+            Prefix: users/
+            ExpirationInDays: 90
+
+  ImageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ImageBucket.Arn, !Sub "${ImageBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # ---------------------------------------------------------------- DynamoDB (key design in dynamodb.py)
+  CreationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: shareToken, AttributeType: S }
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }, { AttributeName: sk, KeyType: RANGE }]
+      GlobalSecondaryIndexes:
+        - IndexName: shareToken-index
+          KeySchema: [{ AttributeName: shareToken, KeyType: HASH }]
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  SlabsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: species, AttributeType: S }
+        - { AttributeName: availability, AttributeType: S }
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }, { AttributeName: sk, KeyType: RANGE }]
+      GlobalSecondaryIndexes:
+        - IndexName: species-availability-index
+          KeySchema:
+            - { AttributeName: species, KeyType: HASH }
+            - { AttributeName: availability, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification: { SSEEnabled: true }
+
+  ProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }, { AttributeName: sk, KeyType: RANGE }]
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  QuotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }, { AttributeName: sk, KeyType: RANGE }]
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  # ---------------------------------------------------------------- OpenSearch Serverless (vector)
+  CollectionEncryption:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${CollectionName}-enc"
+      Type: encryption
+      Policy: !Sub '{"Rules":[{"ResourceType":"collection","Resource":["collection/${CollectionName}"]}],"AWSOwnedKey":true}'
+
+  CollectionNetwork:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${CollectionName}-net"
+      Type: network
+      # Public endpoint, still SigV4/IAM authenticated. Prefer a VPC endpoint for production.
+      Policy: !Sub '[{"Rules":[{"ResourceType":"collection","Resource":["collection/${CollectionName}"]},{"ResourceType":"dashboard","Resource":["collection/${CollectionName}"]}],"AllowFromPublic":true}]'
+
+  Collection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: [CollectionEncryption, CollectionNetwork]
+    Properties:
+      Name: !Ref CollectionName
+      Type: VECTORSEARCH
+
+  CollectionAccess:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "${CollectionName}-access"
+      Type: data
+      Policy: !Sub
+        - >-
+          [{"Rules":[
+            {"ResourceType":"collection","Resource":["collection/${CollectionName}"],"Permission":["aoss:DescribeCollectionItems","aoss:CreateCollectionItems"]},
+            {"ResourceType":"index","Resource":["index/${CollectionName}/*"],"Permission":["aoss:CreateIndex","aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument","aoss:UpdateIndex"]}
+          ],"Principal":["${RoleArn}"]}]
+        - RoleArn: !GetAtt FunctionRole.Arn
+
+  # ---------------------------------------------------------------- SES
+  SenderIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref SesSenderEmail
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com"
+  ImageBucketName:
+    Value: !Ref ImageBucket

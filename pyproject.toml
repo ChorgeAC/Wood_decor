@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tdeez-ai-backend"
+version = "0.1.0"
+description = "AI design and visualization backend for TDeez custom live-edge slab furniture"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "boto3>=1.35",
+    "uvicorn>=0.30",
+    "mangum>=0.19",
+    # Added beyond the agreed stack (see README "Added dependencies"):
+    "PyJWT[crypto]>=2.9",   # Cognito JWT verification (RS256 + JWKS)
+    "opensearch-py>=2.7",   # OpenSearch Serverless k-NN client (SigV4 auth built in)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.27",          # required by FastAPI's TestClient
+    "ruff>=0.6",
+    "mypy>=1.12",
+]
+evals = [
+    "pillow>=10.4",
+    "numpy>=2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tdeez_ai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PL", "C4"]
+ignore = ["PLR0913", "PLR2004", "PLR0911", "PLR0912", "PLR0915", "PLR0917", "RUF012", "E501", "UP047"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*", "opensearchpy.*", "mangum.*"]
+ignore_missing_imports = true
